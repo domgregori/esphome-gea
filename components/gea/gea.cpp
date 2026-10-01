@@ -8,6 +8,9 @@
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/helpers.h"
+#ifdef USE_ESP32
+#include "esp_timer.h"
+#endif
 
 namespace esphome {
 namespace gea {
@@ -215,6 +218,10 @@ void GEAComponent::send_packet_(uint8_t dest, const std::vector<uint8_t> &payloa
   frame.push_back(GEA_STX);
   frame.insert(frame.end(), escaped.begin(), escaped.end());
   frame.push_back(GEA_ETX);
+#ifdef USE_ESP32
+  ESP_LOGW(TAG, "DEBUG-TX @ %lld us: %d bytes, first=0x%02X last=0x%02X", (long long) esp_timer_get_time(),
+           (int) frame.size(), frame.front(), frame.back());
+#endif
   write_array(frame.data(), frame.size());
 
   if (protocol_ == Protocol::GEA2) {
@@ -625,6 +632,9 @@ void GEAComponent::loop() {
   while (available()) {
     if (!read_byte(&byte))
       break;
+#ifdef USE_ESP32
+    ESP_LOGW(TAG, "DEBUG-RX @ %lld us: 0x%02X", (long long) esp_timer_get_time(), byte);
+#endif
     rx_byte_count_++;
     last_rx_byte_ms_ = millis();
     if (consume_gea2_echo_byte_(byte))

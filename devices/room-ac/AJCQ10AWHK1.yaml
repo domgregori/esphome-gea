@@ -1,0 +1,205 @@
+# ESPHome config for a GE room air conditioner via a GEA3-like protocol
+# Appliance: GE "Built-In AC" room air conditioner, model AJCQ10AWHK1
+# Hardware: ESP32-S3 Super Mini
+# TX = GPIO6 (drives the line the unit listens on, ex-"Channel 0"/module TX;
+#      ~5V line, wired direct — 3.3V out is read fine as logic HIGH)
+# RX = GPIO7 (receives the unit's own ~5V TX line, ex-"Channel 1", through a
+#      10k/20k voltage divider down to ~3.3V)
+# Framework: ESP-IDF
+# Baud rate: 19200, but framing/commands match GEA3 (0xA0-0xA8, SUBSCRIBE-ALL,
+# PUBLISH) rather than GEA2's 0xF0/0xF1 polled model. Reverse-engineered with
+# a logic analyzer tapped between the stock WiFi module and the main board —
+# see docs/protocol.md for GEA2/GEA3 background; this unit doesn't match
+# either exactly (GEA2 baud rate, GEA3 command set).
+#
+# Wiring is full-duplex point-to-point (separate TX/RX, no echo, no
+# collisions) — the same topology as a normal GEA3 appliance, just slower.
+# The `gea3` protocol mode has no baud-rate dependency in the component, so
+# running it at 19200 works unmodified.
+#
+# This device fully REPLACES the stock WiFi module (src_address 0xC0 is
+# pinned to match it) — it cannot coexist alongside the stock module, since
+# the main board only has one point-to-point link, not a shared bus.
+#
+# KNOWN GAP — read this before flashing:
+# The main board queries the WiFi-module side directly for ambient
+# temperature (0x7A02), power/energy telemetry (0xD005), and a device-identity
+# handshake (0xDD, non-ERD) after every reboot. The `gea` component is
+# currently client-only — it has no way to *answer* those appliance-initiated
+# requests. This file is control-only (temperature, mode, fan, power, display
+# unit) and does not attempt to serve those fields. Tracked as a TODO on the
+# esphome-gea kanbn board ("AJCQ10AWHK1: add GEA3 responder support").
+#
+# ALSO UNVERIFIED: every state change captured during reverse-engineering was
+# the unit reporting its own state to the WiFi module (unit -> module),
+# even for app-initiated changes. The write direction used here (module ->
+# unit WRITE-REQ) follows the standard GEA3 convention but was never directly
+# observed succeeding on this unit — test each control after flashing.
+
+esphome:
+  name: ge-room-ac
+  friendly_name: GE Room AC
+  project:
+    name: GE.AJCQ10AWHK1
+    version: "1.0.0"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: ../../components
+    components: [gea]
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "ge-room-ac fallback"
+    password: !secret ap_password
+  on_connect:
+    - output.turn_on: led_wifi
+  on_disconnect:
+    - output.turn_off: led_wifi
+
+# ---------------------------------------------------------------------------
+# Status LEDs — placeholder pins carried over from another board, NOT
+# verified against the ESP32-S3 Super Mini. Reassign to real free GPIOs
+# (many Super Mini boards have an onboard LED already, often GPIO48 or
+# GPIO38 depending on revision — check yours) before relying on these.
+# ---------------------------------------------------------------------------
+status_led:
+  pin: GPIO2
+
+output:
+  - platform: gpio
+    pin: GPIO4
+    id: led_wifi
+  - platform: gpio
+    pin: GPIO5
+    id: led_gea
+
+interval:
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: return id(gea_hub).is_bus_connected();
+          then:
+            - output.turn_on: led_gea
+          else:
+            - output.turn_off: led_gea
+
+# ---------------------------------------------------------------------------
+# UART — GEA3 framing/commands, but this unit runs it at 19200 baud
+# ---------------------------------------------------------------------------
+uart:
+  id: uart_gea
+  tx_pin: GPIO6
+  rx_pin: GPIO7
+  baud_rate: 19200
+  data_bits: 8
+  stop_bits: 1
+  parity: NONE
+  rx_buffer_size: 512
+
+# ---------------------------------------------------------------------------
+# GEA3 hub — addresses pinned to match the stock WiFi module (0xC0) and
+# main board (0xBF) observed on the bus.
+# ---------------------------------------------------------------------------
+gea:
+  id: gea_hub
+  uart_id: uart_gea
+  protocol: gea3
+  src_address: 0xC0
+  dest_address: 0xBF
+  erd_lookup: true
+
+# ---------------------------------------------------------------------------
+# Switches
+# ---------------------------------------------------------------------------
+switch:
+  # Power — bit 1 of the 15-byte composite status ERD 0x0A7A.
+  - platform: gea
+    gea_id: gea_hub
+    name: "Power"
+    erd: 0x0A7A
+    byte_offset: 1
+    payload_on: 0x01
+    payload_off: 0x00
+    icon: mdi:power
+
+  # Display unit — 0x00 = Fahrenheit, 0x01 = Celsius. Also mirrored at
+  # byte offset 5 of 0x0A7A, but 0x0007 is a clean standalone ERD.
+  - platform: gea
+    gea_id: gea_hub
+    name: "Display Celsius"
+    erd: 0x0007
+    payload_on: 0x01
+    payload_off: 0x00
+    icon: mdi:temperature-celsius
+    entity_category: config
+
+# ---------------------------------------------------------------------------
+# Selects
+# ---------------------------------------------------------------------------
+select:
+  # Operating mode — one-hot bitmask, not a sequential enum.
+  # 0x08 (Heat) was never exercised during reverse-engineering; omitted
+  # rather than guessed. Add it if this unit turns out to support heat.
+  - platform: gea
+    gea_id: gea_hub
+    name: "Mode"
+    erd: 0x7A01
+    decode: uint8
+    icon: mdi:air-conditioner
+    options:
+      0x00: "Cool"
+      0x01: "Fan"
+      0x02: "Energy Saver"
+      0x04: "Dry"
+
+  # Fan speed — also one-hot bitmask.
+  - platform: gea
+    gea_id: gea_hub
+    name: "Fan Speed"
+    erd: 0x7A00
+    decode: uint8
+    icon: mdi:fan
+    options:
+      0x01: "Auto"
+      0x02: "Low"
+      0x04: "Medium"
+      0x08: "High"
+
+# ---------------------------------------------------------------------------
+# Numbers
+# ---------------------------------------------------------------------------
+number:
+  # Target temperature, °F. Range is a reasonable guess for a room AC —
+  # only 71-73°F was exercised during reverse-engineering; narrow or widen
+  # once the unit's real limits are confirmed.
+  - platform: gea
+    gea_id: gea_hub
+    name: "Target Temperature"
+    erd: 0x7003
+    decode: uint16_be
+    unit_of_measurement: "°F"
+    device_class: temperature
+    min_value: 60
+    max_value: 86
+    step: 1
